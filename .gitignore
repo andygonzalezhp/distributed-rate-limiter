@@ -1,6 +1,7 @@
 # Go binaries
-gateway
-demo-api
+/bin/
+/gateway
+/demo-api
 *.exe
 *.test
 
