@@ -30,3 +30,6 @@ benchmark:
 
 test:
 	go test ./...
+
+api-key-test:
+	k6 run loadtest/api-key-test.js
