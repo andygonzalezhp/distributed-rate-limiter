@@ -16,6 +16,11 @@ import (
 	appmetrics "distributed-rate-limiter/internal/metrics"
 )
 
+const (
+	FailModeOpen   = "open"
+	FailModeClosed = "closed"
+)
+
 func getEnv(key string, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -50,6 +55,19 @@ func getEnvFloat(key string, fallback float64) float64 {
 	}
 
 	return parsed
+}
+
+func normalizeFailMode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+
+	switch value {
+	case FailModeOpen:
+		return FailModeOpen
+	case FailModeClosed:
+		return FailModeClosed
+	default:
+		return FailModeClosed
+	}
 }
 
 func getClientIP(r *http.Request) string {
@@ -94,6 +112,17 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
+func proxyRequest(proxy *httputil.ReverseProxy, w http.ResponseWriter, r *http.Request) int {
+	recorder := &statusRecorder{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
+	}
+
+	proxy.ServeHTTP(recorder, r)
+
+	return recorder.statusCode
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -101,6 +130,7 @@ func main() {
 	redisAddr := getEnv("REDIS_ADDR", "localhost:6379")
 	port := getEnv("PORT", "8080")
 	instanceID := getEnv("INSTANCE_ID", "gateway-local")
+	failMode := normalizeFailMode(getEnv("FAIL_MODE", FailModeClosed))
 
 	backendURL, err := url.Parse(backendAddr)
 	if err != nil {
@@ -120,6 +150,7 @@ func main() {
 	}
 
 	log.Printf("Connected to Redis at %s", redisAddr)
+	log.Printf("Redis failure mode: %s", failMode)
 
 	mux := http.NewServeMux()
 
@@ -136,6 +167,7 @@ func main() {
 
 		w.Header().Set("X-Gateway-Instance", instanceID)
 		w.Header().Set("X-RateLimit-Client", clientID)
+		w.Header().Set("X-RateLimit-Fail-Mode", failMode)
 
 		allowed, remaining, err := rateLimiter.Allow(r.Context(), clientID)
 		if err != nil {
@@ -143,13 +175,37 @@ func main() {
 
 			appmetrics.ObserveRedisError(instanceID)
 
-			statusCode := http.StatusInternalServerError
+			if failMode == FailModeOpen {
+				w.Header().Set("X-RateLimit-Decision", "fail_open")
+
+				statusCode := proxyRequest(proxy, w, r)
+
+				appmetrics.ObserveRequest(
+					instanceID,
+					clientID,
+					"fail_open",
+					statusCode,
+					time.Since(start),
+				)
+
+				return
+			}
+
+			statusCode := http.StatusServiceUnavailable
 
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-RateLimit-Decision", "fail_closed")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(`{"error":"rate limiter unavailable"}`))
 
-			appmetrics.ObserveRequest(instanceID, clientID, "error", statusCode, time.Since(start))
+			appmetrics.ObserveRequest(
+				instanceID,
+				clientID,
+				"fail_closed",
+				statusCode,
+				time.Since(start),
+			)
+
 			return
 		}
 
@@ -160,6 +216,7 @@ func main() {
 			statusCode := http.StatusTooManyRequests
 
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-RateLimit-Decision", "rejected")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(`{"error":"rate limit exceeded"}`))
 
@@ -167,14 +224,11 @@ func main() {
 			return
 		}
 
-		recorder := &statusRecorder{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
+		w.Header().Set("X-RateLimit-Decision", "allowed")
 
-		proxy.ServeHTTP(recorder, r)
+		statusCode := proxyRequest(proxy, w, r)
 
-		appmetrics.ObserveRequest(instanceID, clientID, "allowed", recorder.statusCode, time.Since(start))
+		appmetrics.ObserveRequest(instanceID, clientID, "allowed", statusCode, time.Since(start))
 	})
 
 	addr := ":" + port

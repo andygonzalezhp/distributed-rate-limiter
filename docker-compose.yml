@@ -24,6 +24,7 @@ services:
       - INSTANCE_ID=gateway-1
       - RATE_LIMIT_CAPACITY=10
       - RATE_LIMIT_REFILL_RATE=1
+      - FAIL_MODE=closed
     depends_on:
       - redis
       - demo-api
@@ -40,6 +41,7 @@ services:
       - INSTANCE_ID=gateway-2
       - RATE_LIMIT_CAPACITY=10
       - RATE_LIMIT_REFILL_RATE=1
+      - FAIL_MODE=closed
     depends_on:
       - redis
       - demo-api
@@ -55,6 +57,7 @@ services:
       - INSTANCE_ID=gateway-3
       - RATE_LIMIT_CAPACITY=10
       - RATE_LIMIT_REFILL_RATE=1
+      - FAIL_MODE=closed
     depends_on:
       - redis
       - demo-api
