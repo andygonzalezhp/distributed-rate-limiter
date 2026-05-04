@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: |
+          test -z "$(gofmt -l .)"
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build binaries
+        run: |
+          go build -o bin/demo-api ./cmd/demo-api
+          go build -o bin/gateway ./cmd/gateway
+
+      - name: Build Docker images
+        run: docker compose build
+
+      - name: Start Docker Compose stack
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: sleep 8
+
+      - name: Check running containers
+        run: docker compose ps
+
+      - name: Smoke test gateway health endpoint
+        run: curl -f http://localhost:8080/health
+
+      - name: Smoke test backend through gateway
+        run: curl -f http://localhost:8080/hello
+
+      - name: Smoke test Prometheus metrics endpoint
+        run: curl -f http://localhost:8080/metrics
+
+      - name: Shut down Docker Compose stack
+        if: always()
+        run: docker compose down -v
