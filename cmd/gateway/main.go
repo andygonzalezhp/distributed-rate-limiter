@@ -21,6 +21,13 @@ const (
 	FailModeClosed = "closed"
 )
 
+type RouteLimitPolicy struct {
+	Name       string
+	Key        string
+	Capacity   int
+	RefillRate float64
+}
+
 func getEnv(key string, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -94,6 +101,37 @@ func getClientID(r *http.Request) string {
 	return "ip:" + getClientIP(r)
 }
 
+func getRouteLimitPolicy(path string, defaultCapacity int, defaultRefillRate float64) RouteLimitPolicy {
+	if strings.HasPrefix(path, "/admin") {
+		return RouteLimitPolicy{
+			Name:       "admin",
+			Key:        "route:admin",
+			Capacity:   3,
+			RefillRate: 0.5,
+		}
+	}
+
+	if strings.HasPrefix(path, "/search") {
+		return RouteLimitPolicy{
+			Name:       "search",
+			Key:        "route:search",
+			Capacity:   20,
+			RefillRate: 5,
+		}
+	}
+
+	return RouteLimitPolicy{
+		Name:       "default",
+		Key:        "route:default",
+		Capacity:   defaultCapacity,
+		RefillRate: defaultRefillRate,
+	}
+}
+
+func buildBucketID(clientID string, policy RouteLimitPolicy) string {
+	return policy.Key + ":" + clientID
+}
+
 type statusRecorder struct {
 	http.ResponseWriter
 	statusCode int
@@ -139,10 +177,10 @@ func main() {
 
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 
-	capacity := getEnvInt("RATE_LIMIT_CAPACITY", 10)
-	refillRate := getEnvFloat("RATE_LIMIT_REFILL_RATE", 1)
+	defaultCapacity := getEnvInt("RATE_LIMIT_CAPACITY", 10)
+	defaultRefillRate := getEnvFloat("RATE_LIMIT_REFILL_RATE", 1)
 
-	rateLimiter := limiter.NewRedisRateLimiter(redisAddr, capacity, refillRate)
+	rateLimiter := limiter.NewRedisRateLimiter(redisAddr, defaultCapacity, defaultRefillRate)
 	defer rateLimiter.Close()
 
 	if err := rateLimiter.Ping(ctx); err != nil {
@@ -164,12 +202,21 @@ func main() {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		clientID := getClientID(r)
+		policy := getRouteLimitPolicy(r.URL.Path, defaultCapacity, defaultRefillRate)
+		bucketID := buildBucketID(clientID, policy)
 
 		w.Header().Set("X-Gateway-Instance", instanceID)
 		w.Header().Set("X-RateLimit-Client", clientID)
+		w.Header().Set("X-RateLimit-Route", policy.Name)
 		w.Header().Set("X-RateLimit-Fail-Mode", failMode)
 
-		allowed, remaining, err := rateLimiter.Allow(r.Context(), clientID)
+		allowed, remaining, err := rateLimiter.AllowWithLimit(
+			r.Context(),
+			bucketID,
+			policy.Capacity,
+			policy.RefillRate,
+		)
+
 		if err != nil {
 			log.Printf("rate limiter error: %v", err)
 
@@ -209,7 +256,7 @@ func main() {
 			return
 		}
 
-		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(capacity))
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(policy.Capacity))
 		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 
 		if !allowed {

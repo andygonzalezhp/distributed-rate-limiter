@@ -33,3 +33,6 @@ test:
 
 api-key-test:
 	k6 run loadtest/api-key-test.js
+
+route-policy-test:
+	k6 run loadtest/route-policy-test.js

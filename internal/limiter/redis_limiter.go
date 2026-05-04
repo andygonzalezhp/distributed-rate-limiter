@@ -71,8 +71,12 @@ func (r *RedisRateLimiter) Ping(ctx context.Context) error {
 	return r.client.Ping(ctx).Err()
 }
 
-func (r *RedisRateLimiter) Allow(ctx context.Context, clientID string) (bool, int, error) {
-	key := "rate_limit:" + clientID
+func (r *RedisRateLimiter) Allow(ctx context.Context, bucketID string) (bool, int, error) {
+	return r.AllowWithLimit(ctx, bucketID, r.capacity, r.refillRate)
+}
+
+func (r *RedisRateLimiter) AllowWithLimit(ctx context.Context, bucketID string, capacity int, refillRate float64) (bool, int, error) {
+	key := "rate_limit:" + bucketID
 
 	nowMs := time.Now().UnixMilli()
 	ttlMs := r.ttl.Milliseconds()
@@ -81,8 +85,8 @@ func (r *RedisRateLimiter) Allow(ctx context.Context, clientID string) (bool, in
 		ctx,
 		r.client,
 		[]string{key},
-		r.capacity,
-		r.refillRate,
+		capacity,
+		refillRate,
 		nowMs,
 		ttlMs,
 	).Result()
