@@ -1,0 +1,28 @@
+# Go binaries
+gateway
+demo-api
+*.exe
+*.test
+
+# Build artifacts
+dist/
+bin/
+tmp/
+
+# Env files
+.env
+.env.local
+
+# Docker / local files
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# k6 results
+summary.json
+results/
