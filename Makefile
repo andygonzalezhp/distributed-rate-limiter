@@ -27,3 +27,6 @@ quota:
 
 benchmark:
 	k6 run loadtest/basic.js
+
+test:
+	go test ./...
