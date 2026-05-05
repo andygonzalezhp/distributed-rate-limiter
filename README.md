@@ -907,8 +907,3 @@ The workflow checks:
 - Add OpenTelemetry tracing
 - Add route policies through a config file instead of hardcoded mappings
 
-## Resume Bullet
-
-```txt
-Built a distributed rate-limiting gateway in Go with Redis-backed token buckets, atomic Lua scripting, API-key/IP based quotas, route-specific policies, configurable fail-open/fail-closed Redis behavior, Prometheus metrics, Nginx load balancing, and 3 containerized gateway nodes; benchmarked locally with k6 at ~4.4k req/s and ~2.6ms p95 latency.
-```
