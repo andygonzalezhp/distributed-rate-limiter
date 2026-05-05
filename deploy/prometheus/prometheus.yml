@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["prometheus:9090"]
+
+  - job_name: "rate-limiter-gateways"
+    honor_labels: true
+    static_configs:
+      - targets:
+          - "gateway-1:8080"
+          - "gateway-2:8080"
+          - "gateway-3:8080"

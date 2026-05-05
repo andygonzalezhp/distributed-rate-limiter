@@ -2,38 +2,21 @@
 
 ![CI](https://github.com/andygonzalezhp/distributed-rate-limiter/actions/workflows/ci.yml/badge.svg)
 
-A distributed rate-limiting gateway built in Go. The service sits in front of a backend API and enforces global request limits across multiple gateway instances using Redis-backed token buckets.
+A production-style distributed rate-limiting gateway built in Go. The service sits in front of a backend API and enforces global request quotas across multiple horizontally scaled gateway instances using Redis-backed token buckets and atomic Lua scripting.
 
-Built as a backend/systems engineering project focused on distributed state, atomic updates, reverse proxying, load balancing, observability, failure-mode tradeoffs, and performance benchmarking.
+Built as a backend/systems engineering project focused on distributed state, concurrency safety, reverse proxying, load balancing, observability, failure-mode tradeoffs, and performance benchmarking.
 
-## Overview
+## Why This Project Matters
 
-This project implements a production-style distributed rate limiter that can be placed in front of an API to protect backend services from excessive traffic, noisy neighbors, or abusive clients.
+In a horizontally scaled API gateway, local in-memory rate limiting breaks down because each gateway node tracks its own quota independently. If each node allows 10 requests and traffic is spread across 3 nodes, a client could effectively make 30 requests instead of the intended global limit of 10.
 
-The gateway supports:
-
-- Reverse proxying requests to a backend API
-- Per-client token bucket rate limiting
-- API-key based quota enforcement
-- IP-based fallback quota enforcement
-- Shared distributed state through Redis
-- Atomic quota updates using Redis Lua scripting
-- Route-specific rate limit policies
-- Configurable fail-open / fail-closed Redis failure behavior
-- Horizontal scaling across multiple gateway nodes
-- Nginx load balancing
-- Prometheus metrics
-- Docker Compose deployment
-- k6 load testing
-- Unit tests for the core token bucket algorithm
-- GitHub Actions CI
+This project solves that by storing token bucket state in Redis and updating it atomically with Lua scripts, allowing multiple stateless gateway nodes to enforce a shared global quota.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
     Client[Client] --> Nginx[Nginx Load Balancer]
-
     Nginx --> G1[Gateway 1]
     Nginx --> G2[Gateway 2]
     Nginx --> G3[Gateway 3]
@@ -45,6 +28,11 @@ flowchart TD
     G1 --> API[Demo Backend API]
     G2 --> API
     G3 --> API
+
+    G1 --> Prometheus[Prometheus]
+    G2 --> Prometheus
+    G3 --> Prometheus
+    Prometheus --> Grafana[Grafana Dashboard]
 ```
 
 ## Tech Stack
@@ -56,13 +44,14 @@ flowchart TD
 - Docker Compose
 - Nginx
 - Prometheus
+- Grafana
 - k6
 - GitHub Actions
 
 ## Features
 
 - Distributed token bucket rate limiting
-- Redis-backed shared state across gateway instances
+- Redis-backed shared quota state across gateway instances
 - Atomic token updates using Redis Lua scripts
 - Three horizontally scaled Go gateway nodes
 - Nginx round-robin load balancing
@@ -73,13 +62,10 @@ flowchart TD
 - Configurable fail-open / fail-closed Redis failure behavior
 - Per-client rate-limit response headers
 - Prometheus `/metrics` endpoint
-- Request count metrics
-- Rejection count metrics
-- Redis error metrics
-- Request latency histograms
-- Dockerized local deployment
-- k6 benchmark tests
-- k6 quota correctness tests
+- Grafana dashboard screenshot for observability
+- Request count, rejection count, Redis error, and latency metrics
+- Docker Compose deployment
+- k6 benchmark and correctness tests
 - Unit tests for token bucket behavior
 - GitHub Actions CI for formatting, tests, builds, and Docker smoke checks
 
@@ -97,9 +83,13 @@ Otherwise:
     client_id = ip:<client-ip>
 ```
 
-The gateway then selects a route-specific rate limit policy based on the request path.
+The gateway then selects a route-specific rate limit policy based on the request path. The Redis bucket key combines the route policy and the client identity:
 
-The token bucket state is stored in Redis instead of local process memory. This allows all gateway instances to enforce the same global rate limit, even when requests are distributed across multiple containers.
+```txt
+rate_limit:route:default:api_key:user-123
+rate_limit:route:admin:api_key:user-123
+rate_limit:route:search:ip:192.168.65.1
+```
 
 The Redis update is performed using a Lua script so that the following operations happen atomically:
 
@@ -164,148 +154,11 @@ capacity = 10
 refill_rate = 1 token/second
 ```
 
-This allows a client to make a burst of 10 requests, then regain 1 allowed request per second.
-
-When the client has tokens available, the gateway forwards the request to the backend API.
-
-When the client has no tokens left, the gateway returns:
+This allows a client to make a burst of 10 requests, then regain 1 allowed request per second. When the client has no tokens left, the gateway returns:
 
 ```http
 HTTP/1.1 429 Too Many Requests
 ```
-
-## Client Identification
-
-The gateway supports two forms of client identification.
-
-### API-Key Based Limiting
-
-Requests can include an API key:
-
-```bash
-curl -i -H "X-API-Key: user-123" http://localhost:8080/hello
-```
-
-This creates a Redis bucket such as:
-
-```txt
-rate_limit:route:default:api_key:user-123
-```
-
-Different API keys receive separate buckets.
-
-### IP-Based Fallback
-
-If no API key is provided, the gateway falls back to IP-based limiting:
-
-```txt
-rate_limit:route:default:ip:<client-ip>
-```
-
-This allows the gateway to work with both authenticated and unauthenticated clients.
-
-## Route-Specific Rate Limits
-
-The gateway supports independent Redis-backed buckets per route policy.
-
-Example bucket keys:
-
-```txt
-rate_limit:route:default:api_key:user-123
-rate_limit:route:admin:api_key:user-123
-rate_limit:route:search:api_key:user-123
-```
-
-This means exhausting `/admin` does not exhaust `/hello` or `/search`.
-
-Default route:
-
-```bash
-curl -i http://localhost:8080/hello
-```
-
-Expected headers:
-
-```http
-X-RateLimit-Route: default
-X-RateLimit-Limit: 10
-```
-
-Admin route:
-
-```bash
-for i in {1..6}; do curl -i -s http://localhost:8080/admin | grep -E "HTTP/1.1|X-Ratelimit-Route|X-Ratelimit-Limit|X-Ratelimit-Remaining|X-Ratelimit-Decision"; echo "---"; done
-```
-
-Expected behavior:
-
-```txt
-/admin allows 3 requests, then returns 429 Too Many Requests
-```
-
-Search route:
-
-```bash
-for i in {1..22}; do curl -i -s http://localhost:8080/search | grep -E "HTTP/1.1|X-Ratelimit-Route|X-Ratelimit-Limit|X-Ratelimit-Remaining|X-Ratelimit-Decision"; echo "---"; done
-```
-
-Expected behavior:
-
-```txt
-/search allows 20 requests, then returns 429 Too Many Requests
-```
-
-## Redis Failure Modes
-
-The gateway supports configurable Redis failure behavior.
-
-### Fail-closed mode
-
-With:
-
-```yaml
-FAIL_MODE=closed
-```
-
-If Redis is unavailable, the gateway rejects requests:
-
-```bash
-docker compose stop redis
-curl -i http://localhost:8080/hello
-```
-
-Expected:
-
-```http
-HTTP/1.1 503 Service Unavailable
-X-RateLimit-Decision: fail_closed
-X-RateLimit-Fail-Mode: closed
-```
-
-### Fail-open mode
-
-With:
-
-```yaml
-FAIL_MODE=open
-```
-
-If Redis is unavailable, the gateway allows requests through to the backend:
-
-```bash
-docker compose stop redis
-curl -i http://localhost:8080/hello
-```
-
-Expected:
-
-```http
-HTTP/1.1 200 OK
-X-RateLimit-Decision: fail_open
-X-RateLimit-Fail-Mode: open
-```
-
-Default mode is `closed`.
 
 ## Rate Limit Headers
 
@@ -321,37 +174,36 @@ X-RateLimit-Limit: 10
 X-RateLimit-Remaining: 9
 ```
 
-`X-Gateway-Instance` shows which gateway node handled the request.
-
-`X-RateLimit-Client` shows which client identity was used.
-
-`X-RateLimit-Route` shows which route policy was applied.
-
-`X-RateLimit-Decision` shows whether the request was allowed, rejected, fail-opened, or fail-closed.
+| Header | Description |
+|---|---|
+| `X-Gateway-Instance` | Gateway node that handled the request |
+| `X-RateLimit-Client` | Client identity used for quota enforcement |
+| `X-RateLimit-Route` | Route policy applied to the request |
+| `X-RateLimit-Decision` | `allowed`, `rejected`, `fail_open`, or `fail_closed` |
+| `X-RateLimit-Fail-Mode` | Redis failure behavior |
+| `X-RateLimit-Limit` | Bucket capacity |
+| `X-RateLimit-Remaining` | Remaining tokens after the request |
 
 ## Project Structure
 
 ```txt
 distributed-rate-limiter/
-├── .github/
-│   └── workflows/
-│       └── ci.yml
+├── .github/workflows/ci.yml
 ├── cmd/
-│   ├── demo-api/
-│   │   └── main.go
-│   └── gateway/
-│       └── main.go
+│   ├── demo-api/main.go
+│   └── gateway/main.go
 ├── internal/
 │   ├── limiter/
 │   │   ├── ip_limiter.go
 │   │   ├── redis_limiter.go
 │   │   ├── token_bucket.go
 │   │   └── token_bucket_test.go
-│   └── metrics/
-│       └── metrics.go
+│   └── metrics/metrics.go
 ├── deploy/
-│   └── nginx/
-│       └── nginx.conf
+│   ├── grafana/
+│   ├── nginx/nginx.conf
+│   └── prometheus/prometheus.yml
+├── docs/images/grafana-dashboard.png
 ├── loadtest/
 │   ├── api-key-test.js
 │   ├── basic.js
@@ -386,10 +238,23 @@ The system starts:
 - 1 demo backend API
 - 3 Go gateway containers
 - 1 Nginx load balancer
+- 1 Prometheus container
+- 1 Grafana container
 
-## Test the Gateway
+| Service | URL |
+|---|---|
+| Gateway through Nginx | `http://localhost:8080` |
+| Prometheus | `http://localhost:9090` |
+| Grafana | `http://localhost:3000` |
 
-Send a request through Nginx:
+Default Grafana credentials:
+
+```txt
+username: admin
+password: admin
+```
+
+## Quick Test
 
 ```bash
 curl -i http://localhost:8080/hello
@@ -418,39 +283,28 @@ Example body:
 }
 ```
 
-## Proving Load Balancing
+## Demo Commands
 
-Run:
+### Prove load balancing
 
 ```bash
 for i in {1..9}; do curl -i -s http://localhost:8080/hello | grep X-Gateway-Instance; done
 ```
 
-Expected output:
+Expected output rotates across all gateway nodes:
 
 ```txt
 X-Gateway-Instance: gateway-1
 X-Gateway-Instance: gateway-2
 X-Gateway-Instance: gateway-3
-X-Gateway-Instance: gateway-1
-X-Gateway-Instance: gateway-2
-X-Gateway-Instance: gateway-3
 ```
 
-This proves Nginx is rotating traffic across the three gateway nodes.
-
-## Proving Distributed Rate Limiting
-
-First clear Redis:
+### Prove distributed global quota
 
 ```bash
 docker compose exec redis redis-cli FLUSHALL
-```
 
-Then run:
-
-```bash
-for i in {1..20}; do curl -i -s http://localhost:8080/hello | grep -E "HTTP/1.1|X-Gateway-Instance|X-Ratelimit-Remaining"; echo "---"; done
+for i in {1..20}; do curl -i -s http://localhost:8080/hello | grep -E "HTTP/1.1|X-Gateway-Instance|X-Ratelimit-Remaining|X-Ratelimit-Decision"; echo "---"; done
 ```
 
 Expected behavior:
@@ -459,145 +313,132 @@ Expected behavior:
 HTTP/1.1 200 OK
 X-Gateway-Instance: gateway-1
 X-Ratelimit-Remaining: 9
+X-Ratelimit-Decision: allowed
 ---
 HTTP/1.1 200 OK
 X-Gateway-Instance: gateway-2
 X-Ratelimit-Remaining: 8
----
-HTTP/1.1 200 OK
-X-Gateway-Instance: gateway-3
-X-Ratelimit-Remaining: 7
+X-Ratelimit-Decision: allowed
 ---
 ...
 HTTP/1.1 429 Too Many Requests
-X-Gateway-Instance: gateway-2
 X-Ratelimit-Remaining: 0
+X-Ratelimit-Decision: rejected
 ---
 ```
 
-This proves that all gateway nodes share the same Redis-backed token bucket.
-
-Without Redis, each gateway would have its own independent bucket. With Redis, the rate limit is enforced globally across all instances.
-
-## Proving API-Key Based Quotas
-
-Clear Redis:
+### Prove API-key based quotas
 
 ```bash
 docker compose exec redis redis-cli FLUSHALL
-```
 
-Send 12 requests as `user-123`:
-
-```bash
 for i in {1..12}; do curl -i -s -H "X-API-Key: user-123" http://localhost:8080/hello | grep -E "HTTP/1.1|X-Ratelimit-Client|X-Ratelimit-Remaining"; echo "---"; done
-```
 
-Expected behavior:
-
-```txt
-HTTP/1.1 200 OK
-X-Ratelimit-Client: api_key:user-123
-X-Ratelimit-Remaining: 9
----
-...
-HTTP/1.1 200 OK
-X-Ratelimit-Remaining: 0
----
-HTTP/1.1 429 Too Many Requests
-X-Ratelimit-Remaining: 0
----
-```
-
-Now send requests as a different API key:
-
-```bash
 for i in {1..3}; do curl -i -s -H "X-API-Key: user-456" http://localhost:8080/hello | grep -E "HTTP/1.1|X-Ratelimit-Client|X-Ratelimit-Remaining"; echo "---"; done
 ```
 
-Expected behavior:
+Different API keys receive separate buckets.
 
-```txt
-HTTP/1.1 200 OK
-X-Ratelimit-Client: api_key:user-456
-X-Ratelimit-Remaining: 9
----
-HTTP/1.1 200 OK
-X-Ratelimit-Remaining: 8
----
-```
-
-This proves different API keys receive separate rate-limit buckets.
-
-## Proving Independent Route Buckets
-
-Clear Redis:
+### Prove route-specific limits
 
 ```bash
 docker compose exec redis redis-cli FLUSHALL
+
+for i in {1..6}; do curl -i -s http://localhost:8080/admin | grep -E "HTTP/1.1|X-Ratelimit-Route|X-Ratelimit-Limit|X-Ratelimit-Remaining|X-Ratelimit-Decision"; echo "---"; done
 ```
 
-Exhaust `/admin` for one API key:
+Expected behavior:
+
+```txt
+/admin allows 3 requests, then returns 429 Too Many Requests
+```
 
 ```bash
+docker compose exec redis redis-cli FLUSHALL
+
+for i in {1..22}; do curl -i -s http://localhost:8080/search | grep -E "HTTP/1.1|X-Ratelimit-Route|X-Ratelimit-Limit|X-Ratelimit-Remaining|X-Ratelimit-Decision"; echo "---"; done
+```
+
+Expected behavior:
+
+```txt
+/search allows 20 requests, then returns 429 Too Many Requests
+```
+
+### Prove independent route buckets
+
+```bash
+docker compose exec redis redis-cli FLUSHALL
+
 for i in {1..5}; do curl -i -s -H "X-API-Key: user-123" http://localhost:8080/admin | grep -E "HTTP/1.1|X-Ratelimit-Route|X-Ratelimit-Remaining|X-Ratelimit-Decision"; echo "---"; done
+
+curl -i -H "X-API-Key: user-123" http://localhost:8080/hello
+
+docker compose exec redis redis-cli KEYS "rate_limit:*"
 ```
 
-Then call `/hello` with the same API key:
+Expected Redis keys:
+
+```txt
+rate_limit:route:default:api_key:user-123
+rate_limit:route:admin:api_key:user-123
+```
+
+This proves exhausting `/admin` does not exhaust `/hello`.
+
+## Redis Failure Modes
+
+### Fail-closed mode
+
+With:
+
+```yaml
+FAIL_MODE=closed
+```
+
+If Redis is unavailable, the gateway rejects requests:
 
 ```bash
-curl -i -H "X-API-Key: user-123" http://localhost:8080/hello
+docker compose stop redis
+curl -i http://localhost:8080/hello
+docker compose start redis
+```
+
+Expected:
+
+```http
+HTTP/1.1 503 Service Unavailable
+X-RateLimit-Decision: fail_closed
+X-RateLimit-Fail-Mode: closed
+```
+
+### Fail-open mode
+
+With:
+
+```yaml
+FAIL_MODE=open
+```
+
+If Redis is unavailable, the gateway allows requests through to the backend:
+
+```bash
+docker compose stop redis
+curl -i http://localhost:8080/hello
+docker compose start redis
 ```
 
 Expected:
 
 ```http
 HTTP/1.1 200 OK
-X-RateLimit-Client: api_key:user-123
-X-RateLimit-Route: default
-X-RateLimit-Remaining: 9
+X-RateLimit-Decision: fail_open
+X-RateLimit-Fail-Mode: open
 ```
 
-This proves exhausting `/admin` does not exhaust `/hello`.
+The default mode is `closed`.
 
-## Inspecting Redis State
-
-Open Redis CLI:
-
-```bash
-docker compose exec redis redis-cli
-```
-
-List rate-limit keys:
-
-```redis
-KEYS rate_limit:*
-```
-
-Example output:
-
-```txt
-1) "rate_limit:route:default:api_key:user-123"
-2) "rate_limit:route:admin:api_key:user-123"
-3) "rate_limit:route:search:api_key:user-123"
-```
-
-Inspect a bucket:
-
-```redis
-HGETALL rate_limit:route:admin:api_key:user-123
-```
-
-Example Redis state:
-
-```txt
-1) "tokens"
-2) "0.16499999999999954"
-3) "last_refill"
-4) "1777929314667"
-```
-
-## Metrics
+## Observability
 
 The gateway exposes Prometheus metrics at:
 
@@ -605,30 +446,12 @@ The gateway exposes Prometheus metrics at:
 GET /metrics
 ```
 
-Test the metrics endpoint:
-
-```bash
-curl -s http://localhost:8080/metrics | head -n 20
-```
-
-You should see default Go runtime metrics such as:
+Prometheus scrapes all three gateway instances directly:
 
 ```txt
-go_gc_duration_seconds
-go_goroutines
-go_info
-```
-
-Generate some traffic:
-
-```bash
-for i in {1..9}; do curl -s http://localhost:8080/hello > /dev/null; done
-```
-
-Then check custom rate limiter metrics:
-
-```bash
-for i in {1..6}; do curl -s http://localhost:8080/metrics | grep rate_limiter; echo "---"; done
+gateway-1:8080
+gateway-2:8080
+gateway-3:8080
 ```
 
 Custom metrics include:
@@ -645,9 +468,47 @@ Example metric:
 rate_limiter_requests_total{client_type="ip",decision="allowed",instance="gateway-1",status_code="200"} 3
 ```
 
-Because Nginx load balances `/metrics` requests too, repeated calls may return metrics from different gateway instances.
+### Prometheus
 
-In a production deployment, Prometheus would scrape each gateway instance directly.
+Open:
+
+```txt
+http://localhost:9090
+```
+
+Go to:
+
+```txt
+Status -> Target health
+```
+
+Expected targets:
+
+```txt
+gateway-1:8080    UP
+gateway-2:8080    UP
+gateway-3:8080    UP
+prometheus:9090   UP
+```
+
+### Grafana Dashboard
+
+Open:
+
+```txt
+http://localhost:3000
+```
+
+The dashboard visualizes:
+
+- Requests/sec by decision
+- Requests/sec by gateway instance
+- Requests/sec by client type
+- p95 request latency
+- Average request latency
+- Redis errors
+
+![Grafana Dashboard](docs/images/grafana-dashboard.png)
 
 ## Testing
 
@@ -725,72 +586,6 @@ Local Docker Compose benchmark with:
 | Test | Requests | Throughput | Avg Latency | p95 Latency | Error Rate |
 |---|---:|---:|---:|---:|---:|
 | Basic load test | 131,913 | ~4,395 req/s | ~1.26ms | ~2.60ms | 0% |
-
-## Correctness Test Results
-
-### Global quota correctness
-
-With a rate limit of 10 requests:
-
-```txt
-200 instance=gateway-1 remaining=9
-200 instance=gateway-2 remaining=8
-200 instance=gateway-3 remaining=7
-200 instance=gateway-1 remaining=6
-200 instance=gateway-2 remaining=5
-200 instance=gateway-3 remaining=4
-200 instance=gateway-1 remaining=3
-200 instance=gateway-2 remaining=2
-200 instance=gateway-3 remaining=1
-200 instance=gateway-1 remaining=0
-429 instance=gateway-2 remaining=0
-429 instance=gateway-3 remaining=0
-429 instance=gateway-1 remaining=0
-```
-
-This shows that traffic is distributed across multiple gateway instances while the quota is enforced globally.
-
-### API-key correctness
-
-With a rate limit of 10 requests per API key:
-
-```txt
-200 client=api_key:user-123 remaining=9
-200 client=api_key:user-123 remaining=8
-...
-200 client=api_key:user-123 remaining=0
-429 client=api_key:user-123 remaining=0
-429 client=api_key:user-123 remaining=0
-
-200 client=api_key:user-456 remaining=9
-200 client=api_key:user-456 remaining=8
-...
-200 client=api_key:user-456 remaining=0
-429 client=api_key:user-456 remaining=0
-429 client=api_key:user-456 remaining=0
-```
-
-This shows that each API key receives an independent Redis-backed token bucket.
-
-### Route policy correctness
-
-With route-specific policies enabled:
-
-```txt
-200 path=/admin route=admin remaining=2 decision=allowed
-200 path=/admin route=admin remaining=1 decision=allowed
-200 path=/admin route=admin remaining=0 decision=allowed
-429 path=/admin route=admin remaining=0 decision=rejected
-429 path=/admin route=admin remaining=0 decision=rejected
-
-200 path=/hello route=default remaining=9 decision=allowed
-200 path=/hello route=default remaining=8 decision=allowed
-
-200 path=/search route=search remaining=19 decision=allowed
-200 path=/search route=search remaining=18 decision=allowed
-```
-
-This shows that route policies are enforced independently.
 
 Note: k6 reports intentional `429 Too Many Requests` responses as HTTP failures by default. In quota correctness tests, those 429 responses are expected behavior.
 
@@ -899,11 +694,14 @@ The workflow checks:
 - Add sliding window rate limiting
 - Add leaky bucket rate limiting
 - Add Kubernetes manifests
-- Add Grafana dashboard
-- Add request logging and tracing
+- Add route policies through a config file instead of hardcoded mappings
 - Add configurable per-plan quotas
-- Add integration tests with Docker Compose
+- Add integration tests for distributed quota behavior
 - Add structured JSON logs
 - Add OpenTelemetry tracing
-- Add route policies through a config file instead of hardcoded mappings
 
+## Resume Bullet
+
+```txt
+Built a distributed rate-limiting gateway in Go with Redis-backed token buckets, atomic Lua scripting, API-key/IP quotas, route-specific policies, configurable Redis failure modes, Prometheus/Grafana observability, Nginx load balancing, and 3 containerized gateway nodes; benchmarked locally with k6 at ~4.4k req/s and ~2.6ms p95 latency.
+```
